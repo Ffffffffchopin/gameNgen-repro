@@ -33,7 +33,7 @@ def get_model(action_dim: int, skip_image_conditioning: bool = False):
         """
         This is to accomodate concatenating previous frames in the channels dimension
         """
-        new_in_channels = 4 * (BUFFER_SIZE + 1)
+        new_in_channels = 4 * (BUFFER_SIZE)
         old_conv_in = unet.conv_in
         new_conv_in = torch.nn.Conv2d(
            new_in_channels, 320, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)

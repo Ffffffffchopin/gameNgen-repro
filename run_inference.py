@@ -19,6 +19,7 @@ from tqdm import tqdm
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
 import os
 from config_sd import BUFFER_SIZE, HEIGHT, REPO_NAME, WIDTH
+from sd3.model import get_model
 
 torch.manual_seed(9052924)
 np.random.seed(9052924)
@@ -292,40 +293,106 @@ def run_inference_with_params(
     return image[0]
 
 
-# if __name__ == "__main__":
-#     device = torch.device(
-#         "cuda"
-#         if torch.cuda.is_available()
-#         else "mps"
-#         if torch.backends.mps.is_available()
-#         else "cpu"
-#     )
-#     batch = load_dataset("P-H-B-D-a16z/ViZDoom-Deathmatch-PPO")["test"][0]
-#     unet = (
-#         UNet2DConditionModel.from_pretrained(args.output_dir, subfolder="unet")
-#         .eval()
-#         .to(device)
-#     )
-#     vae = (
-#         AutoencoderKL.from_pretrained(args.output_dir, subfolder="vae")
-#         .eval()
-#         .to(device)
-#     )
-#     noise_scheduler = DDIMScheduler.from_pretrained(
-#         args.output_dir, subfolder="scheduler"
-#     )
+if __name__ == "__main__":
+    
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "mps"
+        if torch.backends.mps.is_available()
+        else "cpu"
+    )
+    skip_image_conditioning = False
+   
+    dataset = load_dataset("P-H-B-D-a16z/ViZDoom-Deathmatch-PPO")
+    resolution = 512
+    # Create a train-test split
+    dataset = dataset["train"].train_test_split(test_size=0.2)
 
-#     action_embedding = read_action_embedding_from_safetensors(
-#         os.path.join(args.output_dir, "action_embedding_model.safetensors")
-#     )
+    # Create a train-test split
+    train_test_dataset = dataset["train"].train_test_split(test_size=0.1, seed=42)
 
+    # Create a new DatasetDict with train and test splits
+    dataset = DatasetDict({
+        "train": train_test_dataset["train"],
+    })
+
+    train_transforms = transforms.Compose(
+        [
+            transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(resolution),
+            # transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ]
+    )
+
+    def preprocess_train(examples):
+        # TODO: might need some changes here
+        images = []
+        for image_list in examples["images"]:
+            current_images = []
+            image_list = [Image.open(io.BytesIO(base64.b64decode(img))) for img in image_list]
+            for image in image_list:
+                # TODO: convert to RGB? Should already be
+                current_images.append(train_transforms(image))
+            images.append(current_images)
+        return {"pixel_values": images, "input_ids": [tokenizer.encode("doom image, high quality, 4k, high resolution", return_tensors="pt") for _ in images]}
+    
+    train_dataset = dataset["train"].with_transform(preprocess_train)
+    def collate_fn(examples):
+        # Function to create a black screen tensor
+        def create_black_screen(height, width):
+            return torch.zeros(3, height, width, dtype=torch.float32)
+
+        if not skip_image_conditioning:    
+            # Process each example
+            processed_images = []
+            for example in examples:
+                
+                # This means you have BUFFER_SIZE conditioning frames + 1 target frame
+                processed_images.append(torch.stack(example["pixel_values"][:BUFFER_SIZE+1]))
+
+            # Stack all examples
+            # images has shape: (batch_size, frame_buffer, 3, height, width)
+            images = torch.stack(processed_images)
+            images = images.to(memory_format=torch.contiguous_format).float()
+        else:
+            images = torch.stack([example["pixel_values"][0] for example in examples])
+            images = images.to(memory_format=torch.contiguous_format).float()
+        return {
+            "pixel_values": images,
+            "input_ids": torch.stack([example["input_ids"] for example in examples]),
+        }
+    batch_size=4
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        shuffle=True,
+        collate_fn=collate_fn,
+        batch_size=batch_size,
+        num_workers=0,
+    )
+    
+    action_dim = max(max(actions) for actions in dataset['train']['actions'])
+    unet, vae, action_embedding, noise_scheduler, tokenizer, text_encoder = get_model(action_dim, skip_image_conditioning=skip_image_conditioning)
+
+
+    first_batch = next(iter(train_dataloader))
+
+    print(first_batch)
+    print(first_batch['pixel_values'].shape)
+    print(first_batch['input_ids'].shape)
+    import pdb; pdb.set_trace()
+
+   
     # TODO: bring back
-    # run_inference_with_params(
-    #     unet,
-    #     vae,
-    #     noise_scheduler,
-    #     action_embedding,
-    #     tokenizer,
-    #     text_encoder,
-    #     batch,
-    # )
+    run_inference_with_params(
+        unet,
+        vae,
+        noise_scheduler,
+        action_embedding,
+        tokenizer,
+        text_encoder,
+        batch,
+        device,
+    )
